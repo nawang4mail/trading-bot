@@ -1,0 +1,26 @@
+# Secrets & local config
+.env
+settings.json
+
+# Claude Code
+.claude
+
+# Python
+.venv
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Runtime output
+logs/
+bot.pid
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
