@@ -308,8 +308,58 @@ with tab_dash:
             if val == "stop_loss": return "background-color:#3a2a00;color:#ff9800"
             return ""
 
-        st.dataframe(df.style.map(_color, subset=["Signal"]),
-                     use_container_width=True, hide_index=True)
+        def _explain(row):
+            sig = row["Signal"]
+            s = row["Short EMA"]; l = row["Long EMA"]
+            rsi = row["RSI"]; vr = row["Vol Ratio"]
+            te = row["Trend EMA"]; m = row["MACD"]; ms = row["MACD Sig"]
+            if sig == "buy":
+                return (
+                    f"BUY triggered: Short EMA ({s:.2f}) crossed above Long EMA ({l:.2f}), "
+                    f"signaling a bullish reversal. RSI at {rsi:.1f} is below overbought (70), "
+                    f"leaving upside room. Volume ratio {vr:.2f}x confirms above-average activity. "
+                    f"Price is above the 200 EMA ({te:.2f}), aligning with the long-term uptrend. "
+                    f"MACD ({m:.4f}) is above its signal line ({ms:.4f}), confirming bullish momentum."
+                )
+            if sig == "sell":
+                return (
+                    f"SELL triggered: Short EMA ({s:.2f}) crossed below Long EMA ({l:.2f}), "
+                    f"signaling a bearish reversal. RSI at {rsi:.1f} is above oversold (30), "
+                    f"suggesting further downside is possible. Volume ratio {vr:.2f}x confirms above-average activity. "
+                    f"Price is below the 200 EMA ({te:.2f}), aligning with the long-term downtrend. "
+                    f"MACD ({m:.4f}) is below its signal line ({ms:.4f}), confirming bearish momentum."
+                )
+            if sig == "stop_loss":
+                return (
+                    f"STOP LOSS triggered: Price fell below the stop loss threshold, "
+                    f"automatically closing the position to cap losses. "
+                    f"At trigger — RSI: {rsi:.1f}, Short EMA: {s:.2f}, Long EMA: {l:.2f}, "
+                    f"Trend EMA: {te:.2f}."
+                )
+            return ""
+
+        tooltip_df = pd.DataFrame("", index=df.index, columns=df.columns)
+        tooltip_df["Signal"] = df.apply(_explain, axis=1)
+
+        tooltip_css = (
+            "visibility: visible;"
+            "background-color: #1e1e2e;"
+            "color: #cdd6f4;"
+            "border: 1px solid #45475a;"
+            "border-radius: 6px;"
+            "padding: 8px 10px;"
+            "font-size: 12px;"
+            "max-width: 340px;"
+            "white-space: normal;"
+            "z-index: 9999;"
+        )
+
+        st.dataframe(
+            df.style
+              .map(_color, subset=["Signal"])
+              .set_tooltips(tooltip_df, props=tooltip_css),
+            use_container_width=True, hide_index=True,
+        )
 
     dashboard_live()
 
