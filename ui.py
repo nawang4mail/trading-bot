@@ -308,7 +308,7 @@ with tab_dash:
             if val == "stop_loss": return "background-color:#3a2a00;color:#ff9800"
             return ""
 
-        st.dataframe(df.style.applymap(_color, subset=["Signal"]),
+        st.dataframe(df.style.map(_color, subset=["Signal"]),
                      use_container_width=True, hide_index=True)
 
     dashboard_live()
