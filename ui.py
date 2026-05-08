@@ -302,11 +302,11 @@ with tab_dash:
         df.columns = ["Time", "Symbol", "Signal", "Short EMA", "Long EMA",
                       "RSI", "Vol Ratio", "Trend EMA", "MACD", "MACD Sig"]
 
-        def _color(val):
-            if val == "buy":       return "background-color:#1a3a1a;color:#4caf50"
-            if val == "sell":      return "background-color:#3a1a1a;color:#f44336"
-            if val == "stop_loss": return "background-color:#3a2a00;color:#ff9800"
-            return ""
+        _SIGNAL_STYLES = {
+            "buy":       "background:#1a3a1a;color:#4caf50",
+            "sell":      "background:#3a1a1a;color:#f44336",
+            "stop_loss": "background:#3a2a00;color:#ff9800",
+        }
 
         def _explain(row):
             sig = row["Signal"]
@@ -338,28 +338,60 @@ with tab_dash:
                 )
             return ""
 
-        tooltip_df = pd.DataFrame("", index=df.index, columns=df.columns)
-        tooltip_df["Signal"] = df.apply(_explain, axis=1)
+        def _fmt(v):
+            try:    return f"{float(v):.4f}"
+            except: return str(v)
 
-        tooltip_css = (
-            "visibility: visible;"
-            "background-color: #1e1e2e;"
-            "color: #cdd6f4;"
-            "border: 1px solid #45475a;"
-            "border-radius: 6px;"
-            "padding: 8px 10px;"
-            "font-size: 12px;"
-            "max-width: 340px;"
-            "white-space: normal;"
-            "z-index: 9999;"
-        )
+        thead_cols = ["Time", "Symbol", "Signal", "Short EMA", "Long EMA",
+                      "RSI", "Vol Ratio", "Trend EMA", "MACD", "MACD Sig"]
+        th_cells = "".join(f"<th>{c}</th>" for c in thead_cols)
 
-        st.dataframe(
-            df.style
-              .map(_color, subset=["Signal"])
-              .set_tooltips(tooltip_df, props=tooltip_css),
-            use_container_width=True, hide_index=True,
-        )
+        rows_html = ""
+        for _, row in df.iterrows():
+            sig       = row["Signal"]
+            badge_css = _SIGNAL_STYLES.get(sig, "")
+            sig_cell  = (
+                f'<td><div class="tip-wrap">'
+                f'<span class="sig-badge" style="{badge_css}">{sig}</span>'
+                f'<div class="tip-box">{_explain(row)}</div>'
+                f'</div></td>'
+            )
+            cells = ""
+            for col in thead_cols:
+                if col == "Signal":
+                    cells += sig_cell
+                elif col in ("Time", "Symbol"):
+                    cells += f"<td>{row[col]}</td>"
+                else:
+                    cells += f"<td>{_fmt(row[col])}</td>"
+            rows_html += f"<tr>{cells}</tr>"
+
+        html = f"""
+<style>
+  .sig-tbl {{width:100%;border-collapse:collapse;font-size:13px;}}
+  .sig-tbl th {{padding:6px 10px;text-align:left;border-bottom:1px solid #333;color:#888;font-weight:500;white-space:nowrap;}}
+  .sig-tbl td {{padding:6px 10px;border-bottom:1px solid #1e1e1e;white-space:nowrap;}}
+  .tip-wrap {{position:relative;display:inline-block;}}
+  .sig-badge {{padding:2px 10px;border-radius:4px;cursor:help;font-weight:600;font-size:12px;}}
+  .tip-box {{
+    visibility:hidden;opacity:0;
+    background:#1e1e2e;color:#cdd6f4;
+    border:1px solid #45475a;border-radius:6px;
+    padding:10px 13px;font-size:12px;line-height:1.6;
+    max-width:340px;white-space:normal;
+    position:absolute;z-index:9999;
+    bottom:130%;left:50%;transform:translateX(-50%);
+    transition:opacity .15s ease;
+    pointer-events:none;
+  }}
+  .tip-wrap:hover .tip-box {{visibility:visible;opacity:1;}}
+</style>
+<table class="sig-tbl">
+  <thead><tr>{th_cells}</tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+"""
+        st.markdown(html, unsafe_allow_html=True)
 
     dashboard_live()
 
