@@ -12,11 +12,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
-PID_FILE  = Path("bot.pid")
+PID_FILE   = Path("bot.pid")
 SIGNAL_LOG = Path("logs/signals.jsonl")
+
+MARKET_INDICES = {
+    "S&P 500":      "SPY",
+    "Nasdaq 100":   "QQQ",
+    "Dow Jones":    "DIA",
+    "Russell 2000": "IWM",
+}
+
+# (timeframe_str, bar_limit, x_axis_format)
+_PERIOD_CFG = {
+    "1D": ("minute",  390, "%H:%M"),
+    "1W": ("5minute", 390, "%b %d"),
+    "1M": ("day",      23, "%b %d"),
+    "3M": ("day",      66, "%b %d"),
+}
 
 st.set_page_config(page_title="Trading Bot", page_icon="📈", layout="wide")
 
@@ -36,6 +52,117 @@ def get_client():
     if CONFIG_OK:
         config.maybe_reload()
     return TradingClient(config.API_KEY, config.API_SECRET, paper=config.PAPER)
+
+
+def get_data_client():
+    from alpaca.data.historical import StockHistoricalDataClient
+    if CONFIG_OK:
+        config.maybe_reload()
+    return StockHistoricalDataClient(config.API_KEY, config.API_SECRET)
+
+
+# ── Market data helpers ───────────────────────────────────────────────────────
+
+def _fetch_bars(symbol: str, tf_str: str, limit: int) -> pd.DataFrame:
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from alpaca.data.enums import DataFeed
+
+    tf_map = {
+        "minute":  TimeFrame.Minute,
+        "5minute": TimeFrame(5, TimeFrameUnit.Minute),
+        "day":     TimeFrame.Day,
+    }
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=tf_map[tf_str],
+        limit=limit,
+        feed=DataFeed.IEX,
+    )
+    bars = get_data_client().get_stock_bars(req).df
+    if bars.empty:
+        return pd.DataFrame()
+    if isinstance(bars.index, pd.MultiIndex):
+        return bars.loc[symbol].reset_index()
+    return bars.reset_index()
+
+
+def _fetch_quote(symbol: str) -> tuple[float, float]:
+    """Return (current_close, day_pct_change) from last 2 daily bars."""
+    df = _fetch_bars(symbol, "day", 2)
+    if df.empty or len(df) < 2:
+        return 0.0, 0.0
+    cur  = float(df.iloc[-1]["close"])
+    prev = float(df.iloc[-2]["close"])
+    pct  = (cur - prev) / prev * 100 if prev else 0.0
+    return cur, pct
+
+
+def _make_chart(df: pd.DataFrame, period: str) -> alt.Chart:
+    tf_str, _, x_fmt = _PERIOD_CFG[period]
+    x_enc = alt.X("timestamp:T", axis=alt.Axis(title=None, format=x_fmt, labelAngle=-30))
+
+    if tf_str == "minute":
+        # Area + line chart for intraday
+        base = alt.Chart(df)
+        area = base.mark_area(
+            line={"color": "#26a69a", "strokeWidth": 1.5},
+            color=alt.Gradient(
+                gradient="linear",
+                stops=[
+                    alt.GradientStop(color="rgba(38,166,154,0.25)", offset=0),
+                    alt.GradientStop(color="rgba(38,166,154,0.0)", offset=1),
+                ],
+                x1=1, x2=1, y1=1, y2=0,
+            ),
+        ).encode(
+            x=x_enc,
+            y=alt.Y("close:Q", scale=alt.Scale(zero=False), title="Price ($)"),
+            tooltip=[
+                alt.Tooltip("timestamp:T", title="Time", format="%H:%M"),
+                alt.Tooltip("close:Q",     title="Price", format="$.2f"),
+                alt.Tooltip("volume:Q",    title="Volume", format=","),
+            ],
+        )
+        vol = alt.Chart(df).mark_bar(opacity=0.35, color="#26a69a").encode(
+            x=x_enc,
+            y=alt.Y("volume:Q", title="Volume", axis=alt.Axis(format="~s")),
+            tooltip=[alt.Tooltip("volume:Q", title="Volume", format=",")],
+        ).properties(height=80)
+        return alt.vconcat(area.properties(height=350), vol).resolve_scale(x="shared")
+
+    # Candlestick for multi-day periods
+    color_cond = alt.condition(
+        "datum.close >= datum.open",
+        alt.value("#26a69a"),
+        alt.value("#ef5350"),
+    )
+    base = alt.Chart(df).encode(x=x_enc, color=color_cond)
+    wicks   = base.mark_rule().encode(
+        y=alt.Y("low:Q",  scale=alt.Scale(zero=False), title="Price ($)"),
+        y2="high:Q",
+        tooltip=[
+            alt.Tooltip("timestamp:T", title="Date",  format="%Y-%m-%d"),
+            alt.Tooltip("open:Q",      title="Open",  format="$.2f"),
+            alt.Tooltip("high:Q",      title="High",  format="$.2f"),
+            alt.Tooltip("low:Q",       title="Low",   format="$.2f"),
+            alt.Tooltip("close:Q",     title="Close", format="$.2f"),
+            alt.Tooltip("volume:Q",    title="Volume", format=","),
+        ],
+    )
+    candles = base.mark_bar(size=6).encode(
+        y=alt.Y("open:Q",  scale=alt.Scale(zero=False)),
+        y2="close:Q",
+    )
+    vol = alt.Chart(df).mark_bar(opacity=0.35).encode(
+        x=x_enc,
+        y=alt.Y("volume:Q", title="Volume", axis=alt.Axis(format="~s")),
+        color=color_cond,
+    ).properties(height=80)
+    return alt.vconcat(
+        (wicks + candles).properties(height=350),
+        vol,
+    ).resolve_scale(x="shared")
 
 
 # ── Bot helpers ───────────────────────────────────────────────────────────────
@@ -122,7 +249,9 @@ with st.sidebar:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_portfolio, tab_dash, tab_settings = st.tabs(["💼 Portfolio", "📊 Dashboard", "⚙️ Settings"])
+tab_portfolio, tab_market, tab_dash, tab_settings = st.tabs(
+    ["💼 Portfolio", "📈 Market", "📊 Dashboard", "⚙️ Settings"]
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -256,6 +385,138 @@ with tab_portfolio:
                         st.info(f"{sym} added to watchlist.")
             except Exception as e:
                 st.error(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET TAB
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_market:
+    if not CONFIG_OK:
+        st.error(f"Cannot connect: `{CONFIG_ERROR}`")
+        st.info("Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file, then restart Streamlit.")
+    else:
+        # ── Market Summary ────────────────────────────────────────────────────
+        @st.fragment(run_every=refresh_sec)
+        def market_summary():
+            st.subheader("Market Summary")
+            cols = st.columns(len(MARKET_INDICES))
+            for (label, sym), col in zip(MARKET_INDICES.items(), cols):
+                try:
+                    price, pct = _fetch_quote(sym)
+                    col.metric(
+                        label,
+                        f"${price:,.2f}",
+                        f"{pct:+.2f}%",
+                        delta_color="normal",
+                    )
+                except Exception:
+                    col.metric(label, "—", "unavailable")
+
+        market_summary()
+
+        st.divider()
+
+        # ── Symbol Chart ──────────────────────────────────────────────────────
+        st.subheader("Symbol Chart")
+
+        index_syms  = list(MARKET_INDICES.values())
+        config.maybe_reload()
+        watch_syms  = config.SYMBOLS
+        all_syms    = list(dict.fromkeys(watch_syms + index_syms))
+
+        ctrl_l, ctrl_r = st.columns([3, 1])
+        selected_sym = ctrl_l.selectbox("Symbol", all_syms, label_visibility="collapsed")
+        period       = ctrl_r.radio("Period", list(_PERIOD_CFG.keys()), horizontal=True, label_visibility="collapsed")
+
+        @st.fragment(run_every=refresh_sec)
+        def symbol_chart(sym: str, per: str):
+            tf_str, limit, _ = _PERIOD_CFG[per]
+            try:
+                df = _fetch_bars(sym, tf_str, limit)
+            except Exception as e:
+                st.error(f"Could not load data for {sym}: {e}")
+                return
+
+            if df.empty:
+                st.warning(f"No data returned for **{sym}**. Market may be closed or symbol is invalid.")
+                return
+
+            # Header metrics
+            cur   = float(df.iloc[-1]["close"])
+            first = float(df.iloc[0]["open"])
+            chg   = cur - first
+            pct   = chg / first * 100 if first else 0.0
+            hi    = float(df["high"].max())
+            lo    = float(df["low"].min())
+            vol   = int(df["volume"].sum())
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric(sym, f"${cur:,.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
+            m2.metric("Period High", f"${hi:,.2f}")
+            m3.metric("Period Low",  f"${lo:,.2f}")
+            m4.metric("Period Vol",  f"{vol:,}")
+            m5.metric("Bars",        f"{len(df):,}")
+
+            chart = _make_chart(df, per)
+            st.altair_chart(chart, use_container_width=True)
+
+        symbol_chart(selected_sym, period)
+
+        st.divider()
+
+        # ── Watchlist Manager ─────────────────────────────────────────────────
+        st.subheader("Watchlist")
+        config.maybe_reload()
+
+        # Display current symbols as removable chips
+        sym_cols = st.columns(min(len(config.SYMBOLS), 8) or 1)
+        for i, sym in enumerate(config.SYMBOLS):
+            with sym_cols[i % len(sym_cols)]:
+                if st.button(f"✕ {sym}", key=f"rm_{sym}", use_container_width=True,
+                             help=f"Remove {sym} from watchlist"):
+                    new_syms = [s for s in config.SYMBOLS if s != sym]
+                    config.save({**config.as_dict(), "symbols": new_syms})
+                    if bot_is_running():
+                        restart_bot()
+                        st.success(f"Removed {sym} — bot restarted.")
+                    else:
+                        st.success(f"Removed {sym}.")
+                    st.rerun()
+
+        # Add symbol form
+        with st.form("add_symbol_form", clear_on_submit=True):
+            add_col, btn_col = st.columns([4, 1])
+            new_sym = add_col.text_input(
+                "Add symbol",
+                placeholder="e.g. TSLA",
+                label_visibility="collapsed",
+            )
+            add_clicked = btn_col.form_submit_button("＋ Add", type="primary", use_container_width=True)
+
+        if add_clicked:
+            sym = new_sym.strip().upper()
+            if not sym:
+                st.error("Enter a ticker symbol.")
+            elif sym in config.SYMBOLS:
+                st.warning(f"**{sym}** is already in your watchlist.")
+            else:
+                # Validate by fetching one bar
+                with st.spinner(f"Validating {sym}…"):
+                    try:
+                        df_test = _fetch_bars(sym, "day", 1)
+                        if df_test.empty:
+                            st.error(f"No data found for **{sym}**. Check the ticker and try again.")
+                        else:
+                            config.save({**config.as_dict(), "symbols": config.SYMBOLS + [sym]})
+                            if bot_is_running():
+                                restart_bot()
+                                st.success(f"Added **{sym}** to watchlist — bot restarted.")
+                            else:
+                                st.success(f"Added **{sym}** to watchlist.")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not validate {sym}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
