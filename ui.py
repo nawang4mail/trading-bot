@@ -65,19 +65,34 @@ def get_data_client():
 
 def _fetch_bars(symbol: str, tf_str: str, limit: int) -> pd.DataFrame:
     from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed
 
-    tf_map = {
-        "minute":  TimeFrame.Minute,
-        "5minute": TimeFrame(5, TimeFrameUnit.Minute),
-        "day":     TimeFrame.Day,
-    }
+    # IEX is a real-time trade feed; it only supports minute-level OHLCV.
+    # 5-minute bars: fetch minute bars via IEX and resample in pandas.
+    # Daily bars: omit feed so Alpaca uses its default (SIP) historical store.
+    if tf_str == "5minute":
+        df = _fetch_bars(symbol, "minute", limit * 5)
+        if df.empty:
+            return df
+        return (
+            df.set_index("timestamp")
+            .resample("5min", closed="left", label="left")
+            .agg(open=("open", "first"), high=("high", "max"),
+                 low=("low", "min"), close=("close", "last"),
+                 volume=("volume", "sum"))
+            .dropna(subset=["close"])
+            .tail(limit)
+            .reset_index()
+        )
+
+    tf_map = {"minute": TimeFrame.Minute, "day": TimeFrame.Day}
+    req_kwargs = {"feed": DataFeed.IEX} if tf_str == "minute" else {}
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=tf_map[tf_str],
         limit=limit,
-        feed=DataFeed.IEX,
+        **req_kwargs,
     )
     bars = get_data_client().get_stock_bars(req).df
     if bars.empty:
@@ -100,58 +115,42 @@ def _fetch_quote(symbol: str) -> tuple[float, float]:
 
 def _make_chart(df: pd.DataFrame, period: str) -> alt.Chart:
     tf_str, _, x_fmt = _PERIOD_CFG[period]
+
+    # Fit the y-axis tightly to the actual price range so small moves are visible.
+    y_min = float(df["low"].min())
+    y_max = float(df["high"].max())
+    y_pad = (y_max - y_min) * 0.08
+    y_scale = alt.Scale(domain=[y_min - y_pad, y_max + y_pad])
+
+    tt_fmt = "%H:%M" if tf_str == "minute" else ("%b %d %H:%M" if tf_str == "5minute" else "%Y-%m-%d")
     x_enc = alt.X("timestamp:T", axis=alt.Axis(title=None, format=x_fmt, labelAngle=-30))
 
-    if tf_str == "minute":
-        # Area + line chart for intraday
-        base = alt.Chart(df)
-        area = base.mark_area(
-            line={"color": "#26a69a", "strokeWidth": 1.5},
-            color=alt.Gradient(
-                gradient="linear",
-                stops=[
-                    alt.GradientStop(color="rgba(38,166,154,0.25)", offset=0),
-                    alt.GradientStop(color="rgba(38,166,154,0.0)", offset=1),
-                ],
-                x1=1, x2=1, y1=1, y2=0,
-            ),
-        ).encode(
-            x=x_enc,
-            y=alt.Y("close:Q", scale=alt.Scale(zero=False), title="Price ($)"),
-            tooltip=[
-                alt.Tooltip("timestamp:T", title="Time", format="%H:%M"),
-                alt.Tooltip("close:Q",     title="Price", format="$.2f"),
-                alt.Tooltip("volume:Q",    title="Volume", format=","),
-            ],
-        )
-        vol = alt.Chart(df).mark_bar(opacity=0.35, color="#26a69a").encode(
-            x=x_enc,
-            y=alt.Y("volume:Q", title="Volume", axis=alt.Axis(format="~s")),
-            tooltip=[alt.Tooltip("volume:Q", title="Volume", format=",")],
-        ).properties(height=80)
-        return alt.vconcat(area.properties(height=350), vol).resolve_scale(x="shared")
-
-    # Candlestick for multi-day periods
     color_cond = alt.condition(
         "datum.close >= datum.open",
         alt.value("#26a69a"),
         alt.value("#ef5350"),
     )
     base = alt.Chart(df).encode(x=x_enc, color=color_cond)
-    wicks   = base.mark_rule().encode(
-        y=alt.Y("low:Q",  scale=alt.Scale(zero=False), title="Price ($)"),
+
+    tooltip = [
+        alt.Tooltip("timestamp:T", title="Time" if tf_str == "minute" else "Date", format=tt_fmt),
+        alt.Tooltip("open:Q",      title="Open",   format="$.2f"),
+        alt.Tooltip("high:Q",      title="High",   format="$.2f"),
+        alt.Tooltip("low:Q",       title="Low",    format="$.2f"),
+        alt.Tooltip("close:Q",     title="Close",  format="$.2f"),
+        alt.Tooltip("volume:Q",    title="Volume", format=","),
+    ]
+
+    # Scale bar width to avoid overlap on dense charts (1D ~390 bars vs 3M ~66 bars).
+    bar_w = max(1, min(8, 300 // max(len(df), 1)))
+
+    wicks = base.mark_rule().encode(
+        y=alt.Y("low:Q",  scale=y_scale, title="Price ($)"),
         y2="high:Q",
-        tooltip=[
-            alt.Tooltip("timestamp:T", title="Date",  format="%Y-%m-%d"),
-            alt.Tooltip("open:Q",      title="Open",  format="$.2f"),
-            alt.Tooltip("high:Q",      title="High",  format="$.2f"),
-            alt.Tooltip("low:Q",       title="Low",   format="$.2f"),
-            alt.Tooltip("close:Q",     title="Close", format="$.2f"),
-            alt.Tooltip("volume:Q",    title="Volume", format=","),
-        ],
+        tooltip=tooltip,
     )
-    candles = base.mark_bar(size=6).encode(
-        y=alt.Y("open:Q",  scale=alt.Scale(zero=False)),
+    candles = base.mark_bar(size=bar_w).encode(
+        y=alt.Y("open:Q",  scale=y_scale),
         y2="close:Q",
     )
     vol = alt.Chart(df).mark_bar(opacity=0.35).encode(
@@ -159,6 +158,7 @@ def _make_chart(df: pd.DataFrame, period: str) -> alt.Chart:
         y=alt.Y("volume:Q", title="Volume", axis=alt.Axis(format="~s")),
         color=color_cond,
     ).properties(height=80)
+
     return alt.vconcat(
         (wicks + candles).properties(height=350),
         vol,

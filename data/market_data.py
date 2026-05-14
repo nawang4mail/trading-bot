@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections import defaultdict, deque
 from typing import Callable
@@ -22,6 +23,7 @@ class MarketDataFeed:
         self._hist_client = StockHistoricalDataClient(config.API_KEY, config.API_SECRET)
         self._stream = StockDataStream(config.API_KEY, config.API_SECRET)
         self._bars: dict[str, deque] = defaultdict(self._make_deque)
+        self._subscribed: set[str] = set()
 
     def _make_deque(self):
         # Large enough for 200 EMA + buffer
@@ -61,6 +63,19 @@ class MarketDataFeed:
         logger.info("Historical bars loaded for %s (%d bars each)", symbols, limit)
         return result
 
+    async def subscribe_new(self, symbols: list[str]):
+        """Load history and subscribe to bars for symbols not yet in the stream."""
+        new = [s for s in symbols if s not in self._subscribed]
+        if not new:
+            return
+        try:
+            await asyncio.to_thread(self.load_history, new)
+        except Exception as e:
+            logger.warning("History load failed for %s — will seed from live bars: %s", new, e)
+        self._stream.subscribe_bars(self._handle_bar, *new)
+        self._subscribed.update(new)
+        logger.info("Dynamically subscribed to new symbols: %s", new)
+
     def get_dataframe(self, symbol: str) -> pd.DataFrame:
         return pd.DataFrame(list(self._bars[symbol]))
 
@@ -74,6 +89,7 @@ class MarketDataFeed:
         await self._on_bar(symbol, self.get_dataframe(symbol))
 
     async def run(self, symbols: list[str]):
+        self._subscribed.update(symbols)
         self._stream.subscribe_bars(self._handle_bar, *symbols)
         logger.info("WebSocket subscribed to bars: %s", symbols)
         await self._stream._run_forever()

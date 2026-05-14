@@ -80,6 +80,20 @@ async def on_bar(symbol: str, df: pd.DataFrame):
         order_mgr.sell(symbol)
 
 
+async def watch_symbols(feed: MarketDataFeed):
+    """Poll config every 10 s and subscribe to any symbols added since startup."""
+    known = set(config.SYMBOLS)
+    while True:
+        await asyncio.sleep(10)
+        config.maybe_reload()
+        current = set(config.SYMBOLS)
+        new_syms = current - known
+        if new_syms:
+            logger.info("New symbols detected: %s — loading history and subscribing", sorted(new_syms))
+            await feed.subscribe_new(list(new_syms))
+            known = current
+
+
 async def main():
     mode = "PAPER" if config.PAPER else "LIVE"
     logger.info("Starting trading bot | mode=%s | symbols=%s", mode, config.SYMBOLS)
@@ -91,7 +105,10 @@ async def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.ensure_future(_shutdown()))
 
-    await feed.run(config.SYMBOLS)
+    await asyncio.gather(
+        feed.run(config.SYMBOLS),
+        watch_symbols(feed),
+    )
 
 
 async def _shutdown():
